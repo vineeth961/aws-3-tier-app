@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -38,7 +41,18 @@ jobs:
 
       - name: Lint frontend
         working-directory: frontend
-        run: npm run lint
+        run: |
+          mkdir -p reports
+          npm run lint 2>&1 | tee reports/frontend-lint.log
+
+      - name: Upload frontend lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-lint-report
+          path: frontend/reports/frontend-lint.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Build frontend
         working-directory: frontend
@@ -57,6 +71,28 @@ jobs:
   backend-ci:
     name: Backend CI
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: taskflow_test
+          POSTGRES_PASSWORD: taskflow_test_password
+          POSTGRES_DB: taskflow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U taskflow_test -d taskflow_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_NAME: taskflow_test
+      DB_USER: taskflow_test
+      DB_PASSWORD: taskflow_test_password
+      DB_SSL: "false"
+      NODE_ENV: test
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -68,9 +104,28 @@ jobs:
           cache: npm
           cache-dependency-path: backend/package-lock.json
 
-      - name: Install production dependencies
+      - name: Install backend dependencies
         working-directory: backend
-        run: npm ci --omit=dev
+        run: npm ci
+
+      - name: Run backend integration tests
+        working-directory: backend
+        run: |
+          mkdir -p reports
+          npm test > reports/backend-test.tap 2>&1
+
+      - name: Upload backend test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-report
+          path: backend/reports/backend-test.tap
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Remove development dependencies
+        working-directory: backend
+        run: npm prune --omit=dev
 
       - name: Check backend JavaScript syntax
         working-directory: backend
@@ -93,6 +148,7 @@ jobs:
           retention-days: 1
 
   deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     name: Deploy to AWS Production
     runs-on: ubuntu-latest
     needs:
@@ -280,3 +336,80 @@ jobs:
 
           echo "Timed out waiting for SSM deployment."
           exit 1
+
+      - name: Verify production application and CRUD API
+        env:
+          BASE_URL: https://d3n8y3tkbd3td2.cloudfront.net
+        run: |
+          node <<'NODE'
+          const base = process.env.BASE_URL;
+          const marker = `CI smoke test ${Date.now()}`;
+          let taskId;
+
+          async function request(path, options = {}) {
+            return fetch(`${base}${path}`, {
+              ...options,
+              headers: {
+                'Content-Type': 'application/json',
+                ...(options.headers || {})
+              }
+            });
+          }
+
+          async function main() {
+            const homepage = await request('/');
+            if (!homepage.ok) throw new Error(`Frontend returned HTTP ${homepage.status}`);
+
+            const list = await request('/api/tasks');
+            if (!list.ok) throw new Error(`GET tasks returned HTTP ${list.status}`);
+            const payload = await list.json();
+            if (!payload || !Array.isArray(payload.tasks)) {
+              throw new Error('GET /api/tasks response must contain a tasks array');
+            }
+
+            const created = await request('/api/tasks', {
+              method: 'POST',
+              body: JSON.stringify({
+                title: marker,
+                description: 'Temporary GitHub Actions smoke test',
+                status: 'todo'
+              })
+            });
+            if (created.status !== 201) throw new Error(`POST task returned HTTP ${created.status}`);
+            const createdPayload = await created.json();
+            taskId = createdPayload.task?.id;
+            if (!taskId) throw new Error('POST response did not contain task.id');
+
+            const updated = await request(`/api/tasks/${taskId}`, {
+              method: 'PUT',
+              body: JSON.stringify({
+                title: `${marker} updated`,
+                description: 'Updated by production smoke test',
+                status: 'in_progress'
+              })
+            });
+            if (!updated.ok) throw new Error(`PUT task returned HTTP ${updated.status}`);
+            const updatedPayload = await updated.json();
+            if (updatedPayload.task?.title !== `${marker} updated`) {
+              throw new Error('Updated task response did not match');
+            }
+
+            const deleted = await request(`/api/tasks/${taskId}`, { method: 'DELETE' });
+            if (deleted.status !== 204) throw new Error(`DELETE task returned HTTP ${deleted.status}`);
+            taskId = undefined;
+            console.log('Production frontend and CRUD smoke tests passed.');
+          }
+
+          main().catch(async error => {
+            console.error(error);
+            if (taskId) {
+              try {
+                const cleanup = await request(`/api/tasks/${taskId}`, { method: 'DELETE' });
+                console.log(`Cleanup returned HTTP ${cleanup.status}`);
+              } catch (cleanupError) {
+                console.error('Cleanup failed:', cleanupError);
+              }
+            }
+            process.exitCode = 1;
+          });
+          NODE

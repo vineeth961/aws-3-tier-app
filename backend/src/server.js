@@ -183,6 +183,10 @@ app.use((req, res) => {
     res.status(404).json({ message: 'Route not found' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`TaskFlow API running on port ${PORT}`);
-});
+if (require.main === module) {
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`TaskFlow API running on port ${PORT}`);
+    });
+}
+
+module.exports = app;
