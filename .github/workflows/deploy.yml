@@ -163,6 +163,7 @@ jobs:
           set -euo pipefail
 
           REMOTE_SCRIPT=$(cat <<'REMOTE'
+          #!/bin/bash
           set -Eeuo pipefail
 
           SHA="__GITHUB_SHA__"
@@ -230,6 +231,8 @@ jobs:
           )
 
           REMOTE_SCRIPT="${REMOTE_SCRIPT//__GITHUB_SHA__/${GITHUB_SHA}}"
+
+          REMOTE_SCRIPT="bash -c $(printf '%q' "$REMOTE_SCRIPT")"
 
           PARAMETERS=$(jq -nc --arg command "$REMOTE_SCRIPT" \
             '{commands: [$command]}')
