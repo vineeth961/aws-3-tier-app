@@ -231,12 +231,11 @@ jobs:
 
           REMOTE_SCRIPT="${REMOTE_SCRIPT//__GITHUB_SHA__/${GITHUB_SHA}}"
 
-# Encode the complete script so SSM's /bin/sh does not parse Bash syntax.
-REMOTE_B64=$(printf '%s' "${REMOTE_SCRIPT}" | base64 -w0)
-SSM_COMMAND="printf '%s' '${REMOTE_B64}' | base64 -d | /bin/bash"
+          # Encode the complete script so SSM's /bin/sh does not parse Bash syntax.
+          REMOTE_B64=$(printf '%s' "${REMOTE_SCRIPT}" | base64 -w0)
+          SSM_COMMAND="printf '%s' '${REMOTE_B64}' | base64 -d | /bin/bash"
 
-
-          PARAMETERS=$(jq -nc --arg command "$REMOTE_SCRIPT" \
+          PARAMETERS=$(jq -nc --arg command "$SSM_COMMAND" \
             '{commands: [$command]}')
 
           COMMAND_ID=$(aws ssm send-command \
