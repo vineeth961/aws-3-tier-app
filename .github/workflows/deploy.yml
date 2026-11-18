@@ -163,8 +163,7 @@ jobs:
           set -euo pipefail
 
           REMOTE_SCRIPT=$(cat <<'REMOTE'
-          #!/bin/bash
-          set -Eeuo pipefail
+          set -eu
 
           SHA="__GITHUB_SHA__"
           BASE="/opt/taskflow/deploy"
@@ -232,7 +231,10 @@ jobs:
 
           REMOTE_SCRIPT="${REMOTE_SCRIPT//__GITHUB_SHA__/${GITHUB_SHA}}"
 
-          REMOTE_SCRIPT="bash -c $(printf '%q' "$REMOTE_SCRIPT")"
+# Encode the complete script so SSM's /bin/sh does not parse Bash syntax.
+REMOTE_B64=$(printf '%s' "${REMOTE_SCRIPT}" | base64 -w0)
+SSM_COMMAND="printf '%s' '${REMOTE_B64}' | base64 -d | /bin/bash"
+
 
           PARAMETERS=$(jq -nc --arg command "$REMOTE_SCRIPT" \
             '{commands: [$command]}')
