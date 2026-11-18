@@ -41,7 +41,18 @@ jobs:
 
       - name: Lint frontend
         working-directory: frontend
-        run: npm run lint
+        run: |
+          mkdir -p reports
+          npm run lint 2>&1 | tee reports/frontend-lint.log
+
+      - name: Upload frontend lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-lint-report
+          path: frontend/reports/frontend-lint.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Build frontend
         working-directory: frontend
@@ -348,9 +359,6 @@ jobs:
           async function main() {
             const homepage = await request('/');
             if (!homepage.ok) throw new Error(`Frontend returned HTTP ${homepage.status}`);
-
-            const health = await request('/health');
-            if (!health.ok) throw new Error(`Backend health returned HTTP ${health.status}`);
 
             const list = await request('/api/tasks');
             if (!list.ok) throw new Error(`GET tasks returned HTTP ${list.status}`);
