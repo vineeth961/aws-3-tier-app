@@ -1,0 +1,266 @@
+name: TaskFlow CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_ROLE_ARN: arn:aws:iam::139337687281:role/TaskFlowGitHubActionsRole
+  FRONTEND_BUCKET: taskflow-frontend-139337687281-ap-south-1
+  DEPLOY_BUCKET: taskflow-deploy-139337687281-ap-south-1
+  CLOUDFRONT_DISTRIBUTION_ID: E1DY0LUYGMJBK0
+  EC2_INSTANCE_ID: i-09859cc7be6f8e43b
+
+jobs:
+  frontend-ci:
+    name: Frontend CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          VITE_API_URL: /api
+        run: npm run build
+
+      - name: Upload frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  backend-ci:
+    name: Backend CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install production dependencies
+        working-directory: backend
+        run: npm ci --omit=dev
+
+      - name: Check backend JavaScript syntax
+        working-directory: backend
+        run: |
+          node --check src/server.js
+          node --check src/db.js
+
+      - name: Package backend
+        run: |
+          tar -czf backend-${GITHUB_SHA}.tar.gz \
+            -C backend \
+            src package.json package-lock.json node_modules
+
+      - name: Upload backend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-package
+          path: backend-${{ github.sha }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    name: Deploy to AWS Production
+    runs-on: ubuntu-latest
+    needs:
+      - frontend-ci
+      - backend-ci
+
+    # Configure required reviewers on this GitHub environment
+    environment: production
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist
+
+      - name: Download backend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-package
+          path: backend-package
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy frontend to S3
+        run: |
+          aws s3 sync frontend-dist/ \
+            "s3://${FRONTEND_BUCKET}/" \
+            --delete \
+            --region "${AWS_REGION}"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+            --paths "/*"
+
+      - name: Upload backend artifact to S3
+        run: |
+          aws s3 cp \
+            "backend-package/backend-${GITHUB_SHA}.tar.gz" \
+            "s3://${DEPLOY_BUCKET}/artifacts/backend/${GITHUB_SHA}.tar.gz" \
+            --region "${AWS_REGION}"
+
+      - name: Deploy backend through SSM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REMOTE_SCRIPT=$(cat <<'REMOTE'
+          set -Eeuo pipefail
+
+          SHA="__GITHUB_SHA__"
+          BASE="/opt/taskflow/deploy"
+          BACKEND="${BASE}/backend"
+          STAGE="${BASE}/backend-new-${SHA}"
+          BACKUP="${BASE}/backend-backup-${SHA}"
+          ARCHIVE="/tmp/taskflow-backend-${SHA}.tar.gz"
+
+          echo "Downloading backend artifact..."
+          aws s3 cp \
+            "s3://taskflow-deploy-139337687281-ap-south-1/artifacts/backend/${SHA}.tar.gz" \
+            "${ARCHIVE}" \
+            --region ap-south-1
+
+          echo "Preparing release..."
+          rm -rf "${STAGE}"
+          mkdir -p "${STAGE}"
+          tar -xzf "${ARCHIVE}" -C "${STAGE}"
+
+          if [ ! -f "${BACKEND}/.env" ]; then
+            echo "ERROR: Existing backend .env was not found. Aborting."
+            exit 1
+          fi
+
+          cp "${BACKEND}/.env" "${STAGE}/.env"
+          chmod 600 "${STAGE}/.env"
+          chown -R ubuntu:ubuntu "${STAGE}"
+
+          echo "Switching backend release..."
+          mv "${BACKEND}" "${BACKUP}"
+          mv "${STAGE}" "${BACKEND}"
+
+          if ! systemctl restart taskflow-backend.service; then
+            echo "Restart failed. Rolling back..."
+            rm -rf "${BACKEND}"
+            mv "${BACKUP}" "${BACKEND}"
+            systemctl restart taskflow-backend.service
+            exit 1
+          fi
+
+          echo "Checking backend health..."
+          HEALTHY=0
+          for attempt in $(seq 1 18); do
+            if /opt/taskflow/node/bin/node -e \
+              "require('http').get('http://127.0.0.1:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+            then
+              HEALTHY=1
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "${HEALTHY}" -ne 1 ]; then
+            echo "Health check failed. Rolling back..."
+            rm -rf "${BACKEND}"
+            mv "${BACKUP}" "${BACKEND}"
+            systemctl restart taskflow-backend.service
+            exit 1
+          fi
+
+          echo "Backend deployment successful."
+          rm -f "${ARCHIVE}"
+          REMOTE
+          )
+
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//__GITHUB_SHA__/${GITHUB_SHA}}"
+
+          PARAMETERS=$(jq -nc --arg command "$REMOTE_SCRIPT" \
+            '{commands: [$command]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "$PARAMETERS" \
+            --comment "TaskFlow backend deployment ${GITHUB_SHA}" \
+            --region "${AWS_REGION}" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM command ID: ${COMMAND_ID}"
+
+          for attempt in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${EC2_INSTANCE_ID}" \
+              --region "${AWS_REGION}" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)
+
+            echo "Deployment status: ${STATUS}"
+
+            case "${STATUS}" in
+              Success)
+                echo "Backend deployment completed."
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|Undeliverable|Terminated)
+                aws ssm get-command-invocation \
+                  --command-id "${COMMAND_ID}" \
+                  --instance-id "${EC2_INSTANCE_ID}" \
+                  --region "${AWS_REGION}" \
+                  --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+                  --output json || true
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          echo "Timed out waiting for SSM deployment."
+          exit 1
