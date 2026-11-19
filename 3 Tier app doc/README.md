@@ -112,14 +112,14 @@ through SSM.
 7. Health checks are used to validate the deployment; the workflow
 includes rollback handling.
 
-See [the complete project documentation](docs/PROJECT_DOCUMENTATION.md)
+See [the complete project documentation](PROJECT_DOCUMENTATION.md)
 for implementation details, setup guidance, screenshots to capture, and
 troubleshooting.
 
 ## Documentation
 
 * [Complete implementation and handover
-guide](docs/PROJECT_DOCUMENTATION.md)
+guide](PROJECT_DOCUMENTATION.md)
 
 ## Important notes
 
