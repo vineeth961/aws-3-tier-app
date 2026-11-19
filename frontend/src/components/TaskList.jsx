@@ -11,7 +11,11 @@ const labels = {
 export default function TaskList({ tasks, onRefresh, onEdit }) {
   async function changeStatus(task, status) {
     try {
-      await updateTask(task.id ?? task.task_id, { status })
+      await updateTask(task.id ?? task.task_id, {
+        title: task.title,
+        description: task.description || '',
+        status,
+      })
       onRefresh()
     } catch (err) {
       alert(err.response?.data?.message || 'Failed to update task status')
